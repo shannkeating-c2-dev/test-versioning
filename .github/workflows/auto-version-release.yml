@@ -1,0 +1,246 @@
+name: Auto Version Release
+
+# Allocate the next semantic version from the caller's merge commit, push
+# release/vX.Y.Z, and open a draft GitHub release.
+#
+# The calling job must grant contents: write. A called workflow cannot raise
+# the caller's token permissions.
+#
+#   jobs:
+#     release:
+#       permissions:
+#         contents: write
+#       uses: C2Technologies/shared-workflows/.github/workflows/auto-version-release.yml@<ref>
+#       with:
+#         bump_feature_pattern: feature
+
+on:
+  workflow_call:
+    inputs:
+      bump_feature_pattern:
+        description: "Segment pattern that selects a minor bump. Matched case-insensitively as an extended regular expression, bounded by the start, the end, or / _ -. Any other merged branch bumps patch."
+        required: false
+        type: string
+        default: feature
+    outputs:
+      latest_version:
+        description: "Greatest version already allocated, including draft releases."
+        value: ${{ jobs.create-release.outputs.latest_version }}
+      new_version:
+        description: "Version allocated for this release."
+        value: ${{ jobs.create-release.outputs.new_version }}
+      release_branch:
+        description: "Branch pushed for this release."
+        value: ${{ jobs.create-release.outputs.release_branch }}
+      release_url:
+        description: "URL of the draft GitHub release."
+        value: ${{ jobs.create-release.outputs.release_url }}
+
+permissions:
+  contents: write
+
+# One group for the caller repository, and cancel-in-progress stays false.
+# A second merge waits, then discover sees the version this run allocated.
+concurrency:
+  group: auto-release-version-allocation
+  cancel-in-progress: false
+
+jobs:
+  create-release:
+    name: Create Versioned Release
+    runs-on: ubuntu-latest
+    outputs:
+      latest_version: ${{ steps.discover.outputs.latest_version }}
+      new_version: ${{ steps.calc_version.outputs.new_version }}
+      release_branch: ${{ steps.create_branch.outputs.release_branch }}
+      release_url: ${{ steps.draft.outputs.release_url }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # workflow_run callers pass the merge that completed the build.
+      # push callers are already on that commit.
+      MERGE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      BUMP_FEATURE_PATTERN: ${{ inputs.bump_feature_pattern }}
+      RELEASE_VERSION_SCRIPT: ${{ github.workspace }}/shared-workflows/scripts/release-version.sh
+
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ github.token }}
+
+      - name: Checkout release calculator
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: shared-workflows
+          token: ${{ github.token }}
+
+      # Draft releases do not create reachable Git tags. discover counts tags,
+      # release branches and GitHub releases (including drafts). Legacy branch
+      # names are reported by the calculator; they are not filtered out here.
+      - name: Discover latest allocated version
+        id: discover
+        run: |
+          set -euo pipefail
+
+          git fetch origin \
+            '+refs/heads/release/*:refs/remotes/origin/release/*' \
+            '+refs/tags/*:refs/tags/*'
+
+          git tag --list > /tmp/release_tags.txt
+          git for-each-ref --format='%(refname:short)' 'refs/remotes/origin/release/*' \
+            > /tmp/release_version_branches.txt
+
+          # Fetch separately so an API failure cannot be mistaken for an empty
+          # release list by a downstream filter.
+          if ! gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq '.[].tag_name' > /tmp/github_release_tags.txt; then
+            echo "Unable to list GitHub releases" >&2
+            exit 1
+          fi
+
+          DISCOVERED="$("$RELEASE_VERSION_SCRIPT" discover \
+            /tmp/release_tags.txt \
+            /tmp/release_version_branches.txt \
+            /tmp/github_release_tags.txt)"
+          LATEST_VERSION="$(printf '%s\n' "$DISCOVERED" | sed -n 's/^latest_version=//p')"
+          HISTORY_BASE="$(printf '%s\n' "$DISCOVERED" | sed -n 's/^history_base=//p')"
+          if [[ ! "$LATEST_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "discover did not return a strict semantic version" >&2
+            printf '%s\n' "$DISCOVERED" >&2
+            exit 1
+          fi
+
+          echo "latest_version=${LATEST_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "base_ref=${HISTORY_BASE}" >> "$GITHUB_OUTPUT"
+          echo "Latest allocated version: ${LATEST_VERSION}"
+          echo "Release history base: ${HISTORY_BASE:-<repository start>}"
+
+      - name: Calculate next semantic version
+        id: calc_version
+        run: |
+          set -euo pipefail
+
+          LATEST_VERSION="${{ steps.discover.outputs.latest_version }}"
+          BASE_REF="${{ steps.discover.outputs.base_ref }}"
+
+          if [ -n "$BASE_REF" ]; then
+            COMMIT_MESSAGES="$(git log "${BASE_REF}..HEAD" --pretty=format:"%s%n%b")"
+          else
+            COMMIT_MESSAGES="$(git log --pretty=format:"%s%n%b")"
+          fi
+
+          echo "--- Commit messages since last allocated release ---"
+          printf '%s\n' "$COMMIT_MESSAGES"
+          echo "----------------------------------------------------"
+
+          BRANCHES="$(printf '%s\n' "$COMMIT_MESSAGES" \
+            | grep 'Merge pull request #' \
+            | sed -n 's|.*Merge pull request #[0-9]* from [^/]*/||p' \
+            || true)"
+          SQUASH_BRANCHES="$(printf '%s\n' "$COMMIT_MESSAGES" \
+            | grep -oE '^\* [a-zA-Z0-9/_-]+' \
+            | sed 's|^\* ||' \
+            || true)"
+          printf '%s\n%s\n' "$BRANCHES" "$SQUASH_BRANCHES" > /tmp/merged_branches.txt
+
+          echo "--- Detected source branches ---"
+          cat /tmp/merged_branches.txt
+          echo "--------------------------------"
+
+          NEW_VERSION="$("$RELEASE_VERSION_SCRIPT" bump "$LATEST_VERSION" "$BUMP_FEATURE_PATTERN" < /tmp/merged_branches.txt)"
+          echo "new_version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "New version: ${NEW_VERSION}"
+
+      - name: Create release branch
+        id: create_branch
+        run: |
+          set -euo pipefail
+
+          NEW_VERSION="${{ steps.calc_version.outputs.new_version }}"
+          RELEASE_BRANCH="release/${NEW_VERSION}"
+
+          if git ls-remote --exit-code --heads origin "refs/heads/${RELEASE_BRANCH}" >/dev/null 2>&1; then
+            echo "Refusing to overwrite existing release branch: ${RELEASE_BRANCH}" >&2
+            exit 1
+          fi
+
+          # Keep the API request outside the conditional. A request failure must
+          # stop the job, while grep exit 1 only means the version is available.
+          if ! gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq '.[].tag_name' > /tmp/existing_release_versions.txt; then
+            echo "Unable to verify existing GitHub releases" >&2
+            exit 1
+          fi
+          if grep -Fxq "$NEW_VERSION" /tmp/existing_release_versions.txt; then
+            echo "Refusing to create duplicate GitHub release: ${NEW_VERSION}" >&2
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$RELEASE_BRANCH" "$MERGE_SHA"
+          git push origin "$RELEASE_BRANCH"
+          echo "release_branch=${RELEASE_BRANCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release notes body
+        id: release_notes
+        run: |
+          set -euo pipefail
+
+          BASE_REF="${{ steps.discover.outputs.base_ref }}"
+          if [ -n "$BASE_REF" ]; then
+            LOG="$(git log "${BASE_REF}..HEAD" --pretty=format:"- %s" \
+              | grep -v "^- Merge branch" \
+              | grep -v "^- Merge pull request.*into master" \
+              || true)"
+          else
+            LOG="$(git log --pretty=format:"- %s" \
+              | grep -v "^- Merge branch" \
+              | grep -v "^- Merge pull request.*into master" \
+              || true)"
+          fi
+          printf '%s\n' "$LOG" > /tmp/release_notes.txt
+          echo "notes_file=/tmp/release_notes.txt" >> "$GITHUB_OUTPUT"
+
+      - name: Draft GitHub Release
+        id: draft
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+            const version = "${{ steps.calc_version.outputs.new_version }}";
+            const releaseBranch = "${{ steps.create_branch.outputs.release_branch }}";
+            const notesFile = "${{ steps.release_notes.outputs.notes_file }}";
+            const body = fs.existsSync(notesFile) ? fs.readFileSync(notesFile, 'utf8').trim() : '';
+            const { data: release } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: version,
+              target_commitish: releaseBranch,
+              name: `${context.repo.repo} ${version}`,
+              body: body || `Release ${version}`,
+              draft: true,
+              prerelease: false,
+            });
+            console.log(`Draft release created: ${release.html_url}`);
+            core.setOutput('release_url', release.html_url);
+
+      - name: Print summary
+        run: |
+          echo "## Release Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Previous version | \`${{ steps.discover.outputs.latest_version }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| New version | \`${{ steps.calc_version.outputs.new_version }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Release branch | \`${{ steps.create_branch.outputs.release_branch }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Status | Draft release created ✅ |" >> "$GITHUB_STEP_SUMMARY"

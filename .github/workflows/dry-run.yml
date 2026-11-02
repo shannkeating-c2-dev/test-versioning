@@ -1,0 +1,9 @@
+# .github/workflows/dry-run.yml
+name: Dry run auto version
+on:
+  workflow_dispatch:
+jobs:
+  release:
+    permissions:
+      contents: write
+    uses: ./.github/workflows/auto-version-release.yml
